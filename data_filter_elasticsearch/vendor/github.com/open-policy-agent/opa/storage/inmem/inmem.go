@@ -19,8 +19,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/open-policy-agent/opa/internal/merge"
 
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/util"
@@ -90,6 +94,88 @@ func (db *store) NewTransaction(_ context.Context, params ...storage.Transaction
 		db.rmu.RLock()
 	}
 	return newTransaction(xid, write, context, db), nil
+}
+
+// Truncate implements the storage.Store interface. This method must be called within a transaction.
+func (db *store) Truncate(ctx context.Context, txn storage.Transaction, params storage.TransactionParams, it storage.Iterator) error {
+	var update *storage.Update
+	var err error
+	mergedData := map[string]interface{}{}
+
+	underlying, err := db.underlying(txn)
+	if err != nil {
+		return err
+	}
+
+	for {
+		update, err = it.Next()
+		if err != nil {
+			break
+		}
+
+		if update.IsPolicy {
+			err = underlying.UpsertPolicy(update.Path.String(), update.Value)
+			if err != nil {
+				return err
+			}
+		} else {
+			var value interface{}
+			err = util.Unmarshal(update.Value, &value)
+			if err != nil {
+				return err
+			}
+
+			var key []string
+			dirpath := strings.TrimLeft(update.Path.String(), "/")
+			if len(dirpath) > 0 {
+				key = strings.Split(dirpath, "/")
+			}
+
+			if value != nil {
+				obj, err := mktree(key, value)
+				if err != nil {
+					return err
+				}
+
+				merged, ok := merge.InterfaceMaps(mergedData, obj)
+				if !ok {
+					return fmt.Errorf("failed to insert data file from path %s", filepath.Join(key...))
+				}
+				mergedData = merged
+			}
+		}
+	}
+
+	if err != nil && err != io.EOF {
+		return err
+	}
+
+	if params.RootOverwrite {
+		newPath, ok := storage.ParsePathEscaped("/")
+		if !ok {
+			return fmt.Errorf("storage path invalid: %v", newPath)
+		}
+		return underlying.Write(storage.AddOp, newPath, mergedData)
+	}
+
+	for k := range mergedData {
+		newPath, ok := storage.ParsePathEscaped("/" + k)
+		if !ok {
+			return fmt.Errorf("storage path invalid: %v", newPath)
+		}
+
+		if len(newPath) > 0 {
+			if err := storage.MakeDir(ctx, db, txn, newPath[:len(newPath)-1]); err != nil {
+				return err
+			}
+		}
+
+		if err := underlying.Write(storage.AddOp, newPath, mergedData[k]); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (db *store) Commit(ctx context.Context, txn storage.Transaction) error {
@@ -247,4 +333,25 @@ func invalidPatchError(f string, a ...interface{}) *storage.Error {
 		Code:    storage.InvalidPatchErr,
 		Message: fmt.Sprintf(f, a...),
 	}
+}
+
+func mktree(path []string, value interface{}) (map[string]interface{}, error) {
+	if len(path) == 0 {
+		// For 0 length path the value is the full tree.
+		obj, ok := value.(map[string]interface{})
+		if !ok {
+			return nil, invalidPatchError(rootMustBeObjectMsg)
+		}
+		return obj, nil
+	}
+
+	dir := map[string]interface{}{}
+	for i := len(path) - 1; i > 0; i-- {
+		dir[path[i]] = value
+		value = dir
+		dir = map[string]interface{}{}
+	}
+	dir[path[0]] = value
+
+	return dir, nil
 }
